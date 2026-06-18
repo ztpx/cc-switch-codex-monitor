@@ -1,10 +1,14 @@
-# cc-switch-cli 与 Codex Desktop 配置统一方案
+# cc-switch-cli 与 Codex Desktop 配置统一方案 / Configuration Unification Guide
 
 本文档记录本次 `cc-switch-cli` 管理 Codex CLI / Codex Desktop 远程会话时遇到的问题、最终修复策略、安装步骤和验证方法。后续迁移到其他服务器时，可以直接上传本项目并执行 `scripts/` 下的安装脚本，避免重新手工配置。
 
-## 背景问题
+This guide documents the issue, final strategy, installation steps, verification commands, and troubleshooting flow for keeping Codex CLI / Codex Desktop sessions visible while switching providers with `cc-switch-cli`.
+
+## 背景问题 / Background
 
 远端服务器通过 `cc-switch-cli` 切换 Codex 供应商后，Codex Desktop 远程工作区里的历史会话看起来会丢失。例如：
+
+After switching Codex providers through `cc-switch-cli` on a remote server, Codex Desktop may appear to lose remote workspace history. For example:
 
 - EliasApi 下能看到 `/dep/lx_iso/ubuntu-24.04.3_cipan` 的历史会话。
 - 切到 GGbond 后，同一工作区显示“暂无对话”。
@@ -26,9 +30,13 @@ model_provider = "api"
 
 Codex Desktop 会按 session metadata 里的 `model_provider` 分区展示会话。供应商切换后，Desktop 会进入另一个分区，所以旧会话看起来像丢了。
 
-## 最终策略
+Codex Desktop groups sessions by the `model_provider` stored in session metadata. When provider switching changes this value, Desktop enters a different group, so old sessions look hidden rather than deleted.
+
+## 最终策略 / Final Strategy
 
 统一约束如下：
+
+The normalized rules are:
 
 1. Codex 顶层永远固定：
 
@@ -67,7 +75,7 @@ requires_openai_auth = true
 "model_provider": "custom"
 ```
 
-## 本地文件
+## 本地文件 / Project Files
 
 当前项目文件结构：
 
@@ -84,9 +92,17 @@ docs/cc-switch-codex-monitor-guide.md
 - `cc-switch-refresh-codex`：归一化 Codex 配置、同步当前供应商 key、迁移 session metadata、重启 Codex app-server/proxy。
 - `install-cc-switch-codex-monitor.sh`：通用安装脚本，把原始 `cc-switch-cli` 移动为 `.real`，安装 wrapper/helper，并创建 `ccswitch`、`cc-switch` alias。
 
-## 远端安装步骤
+File responsibilities:
+
+- `cc-switch-cli-wrapper`: wraps the real `cc-switch-cli` and refreshes Codex only when config or DB files changed after the command exits.
+- `cc-switch-refresh-codex`: normalizes Codex config, syncs the current provider key, migrates session metadata, and restarts Codex app-server/proxy.
+- `install-cc-switch-codex-monitor.sh`: installer that moves the original `cc-switch-cli` to `.real`, installs the wrapper/helper, and creates optional aliases.
+
+## 远端安装步骤 / Remote Installation
 
 假设目标服务器已安装官方 `cc-switch-cli`，路径为 `/usr/local/bin/cc-switch-cli`。
+
+Assume the target server already has the official `cc-switch-cli` installed at `/usr/local/bin/cc-switch-cli`.
 
 从本地上传整个项目目录，或在目标服务器上 clone 仓库后执行：
 
@@ -120,7 +136,7 @@ scp bin/cc-switch-cli-wrapper bin/cc-switch-refresh-codex root@<server-ip>:/tmp/
 ssh root@<server-ip> 'install -m 0755 /tmp/cc-switch-cli-wrapper /usr/local/bin/cc-switch-cli && install -m 0755 /tmp/cc-switch-refresh-codex /usr/local/bin/cc-switch-refresh-codex'
 ```
 
-## 运行逻辑
+## 运行逻辑 / Runtime Behavior
 
 ### cc-switch-cli wrapper
 
@@ -145,6 +161,13 @@ $HOME/.cc-switch/cc-switch.db
 - 只在 `ccswitch` TUI 退出后统一检查一次。
 - `provider current` / `provider list` 这类只读命令不会触发刷新。
 
+Refresh behavior:
+
+- It does not refresh every second inside the TUI.
+- It avoids frequent Codex restarts while adding/editing/deleting providers.
+- It checks once after `ccswitch` exits.
+- Read-only commands such as `provider current` / `provider list` do not trigger refresh unless files actually changed.
+
 ### cc-switch-refresh-codex
 
 刷新脚本会做这些事：
@@ -158,7 +181,9 @@ $HOME/.cc-switch/cc-switch.db
 7. 把已有 `/root/.codex/sessions/**/*.jsonl` 第一行 session metadata 里的 `model_provider` 迁移为 `custom`。
 8. 重启 Codex app-server/proxy，让 Codex Desktop/CLI 加载新配置。
 
-## 验证命令
+In short, the refresh helper rewrites Codex provider templates and active config to use `custom`, syncs auth from the current provider, migrates existing session metadata, and restarts Codex processes so the new config is loaded.
+
+## 验证命令 / Verification
 
 查看当前供应商：
 
@@ -250,7 +275,7 @@ Codex restart complete; the next Codex CLI/App connection will load the new conf
 codex config changed while command is running
 ```
 
-## 新增供应商后的预期
+## 新增供应商后的预期 / After Adding a New Provider
 
 在 `ccswitch` TUI 中新增供应商时，cc-switch 可能仍会先按 provider ID 生成模板，例如：
 
@@ -272,9 +297,11 @@ name = "<供应商显示名>"
 
 然后当前 provider 会写入 `/root/.codex/config.toml`。
 
-## 故障排查
+When a new provider is added in the `ccswitch` TUI, native `cc-switch-cli` behavior may generate provider-specific templates first. After the TUI exits, the wrapper detects DB changes and normalizes them back to `custom`.
 
-### 切换后 Desktop 还是看不到历史会话
+## 故障排查 / Troubleshooting
+
+### 切换后 Desktop 还是看不到历史会话 / Desktop Still Cannot See History
 
 检查 session metadata 是否仍有非 `custom`：
 
@@ -299,7 +326,7 @@ PY
 /usr/local/bin/cc-switch-refresh-codex
 ```
 
-### 切换后 Codex 请求 401
+### 切换后 Codex 请求 401 / Codex Returns 401 After Switching
 
 检查 active key 是否等于当前 provider key。不要输出完整 key，可以比较 hash：
 
@@ -314,7 +341,7 @@ with sqlite3.connect("/root/.cc-switch/cc-switch.db") as conn:
 PY
 ```
 
-### 修改后 Codex Desktop 没加载新配置
+### 修改后 Codex Desktop 没加载新配置 / Desktop Did Not Load New Config
 
 手动重启 Codex app-server/proxy：
 
@@ -328,7 +355,7 @@ PY
 pgrep -af 'codex app-server|codex app-server proxy'
 ```
 
-## 给 AI 的实现清单
+## 给 AI 的实现清单 / Implementation Checklist for Another AI
 
 如果后续让另一个 AI 在新服务器实现同样优化，让它按以下清单执行：
 
@@ -345,7 +372,7 @@ pgrep -af 'codex app-server|codex app-server proxy'
 11. 切换至少两个供应商，确认只变化 `name/base_url/model/key`，不变化 `model_provider`。
 12. 运行 `codex exec --json "只回复 OK" </dev/null` 验证请求成功。
 
-## 当前验证过的远端行为
+## 当前验证过的远端行为 / Verified Remote Behavior
 
 在 `10.100.52.179` 上已验证：
 
