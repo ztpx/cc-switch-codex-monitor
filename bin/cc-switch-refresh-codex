@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -u
+
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+LOG_FILE="${CC_SWITCH_CODEX_MONITOR_LOG:-$HOME/.cc-switch/codex-refresh.log}"
+
+log() {
+  if [ "${CC_SWITCH_CODEX_REFRESH_QUIET:-0}" != "1" ]; then
+    printf '[cc-switch] %s\n' "$*" >&2
+  fi
+  local log_dir
+  log_dir="$(dirname "$LOG_FILE")"
+  mkdir -p "$log_dir" 2>/dev/null || true
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+is_own_process() {
+  local pid="$1"
+  [ "$pid" = "$$" ] && return 0
+  [ "$pid" = "${PPID:-}" ] && return 0
+  return 1
+}
+
+collect_codex_pids() {
+  local pid cmd
+  pgrep -af '(^|/| )codex( |$)' 2>/dev/null | while IFS= read -r line; do
+    pid="${line%% *}"
+    cmd="${line#* }"
+
+    if is_own_process "$pid"; then
+      continue
+    fi
+
+    case "$cmd" in
+      *cc-switch-refresh-codex*|*cc-switch-cli-wrapper*|*cc-switch-cli.real*|*cc-switch-cli*|*ccswitch*|*cc-switch*)
+        continue
+        ;;
+    esac
+
+    printf '%s\n' "$pid"
+  done
+}
+
+normalize_codex_config() {
+  CODEX_HOME_DIR="$CODEX_HOME_DIR" CC_SWITCH_DB_PATH="${CC_SWITCH_DB_PATH:-$HOME/.cc-switch/cc-switch.db}" python3 <<'PY'
+import json
+import os
+import pathlib
+import re
+import sqlite3
+import tempfile
+
+codex_home = pathlib.Path(os.environ["CODEX_HOME_DIR"])
+db_path = pathlib.Path(os.environ["CC_SWITCH_DB_PATH"])
+config_path = codex_home / "config.toml"
+auth_path = codex_home / "auth.json"
+sessions_dir = codex_home / "sessions"
+
+if not db_path.exists() or not config_path.exists():
+    raise SystemExit(0)
+
+with sqlite3.connect(db_path) as conn:
+    template_rows = conn.execute(
+        "select id, app_type, name, settings_config from providers where app_type = 'codex'"
+    ).fetchall()
+    normalized_templates = 0
+    for template_id, app_type, template_name, template_settings_config in template_rows:
+        try:
+            template_settings = json.loads(template_settings_config)
+        except json.JSONDecodeError:
+            continue
+        template_config = template_settings.get("config", "")
+        new_template_config = re.sub(
+            r"(?m)^model_provider\s*=.*$",
+            'model_provider = "custom"',
+            template_config,
+        )
+        new_template_config = re.sub(
+            r"(?m)^\[model_providers\.[^\]]+\]$",
+            "[model_providers.custom]",
+            new_template_config,
+        )
+        display_name = json.dumps(str(template_name or template_id), ensure_ascii=False)
+        new_template_config = re.sub(
+            r"(?m)^name\s*=.*$",
+            f"name = {display_name}",
+            new_template_config,
+        )
+        if new_template_config != template_config:
+            template_settings["config"] = new_template_config
+            conn.execute(
+                "update providers set settings_config = ? where id = ? and app_type = ?",
+                (
+                    json.dumps(template_settings, ensure_ascii=False, separators=(",", ":")),
+                    template_id,
+                    app_type,
+                ),
+            )
+            normalized_templates += 1
+    if normalized_templates:
+        conn.commit()
+        print(f"cc-switch Codex provider templates normalized to custom: {normalized_templates} provider(s).")
+
+    row = conn.execute(
+        "select id, name, settings_config from providers "
+        "where app_type = 'codex' and is_current = 1 limit 1"
+    ).fetchone()
+
+if not row:
+    raise SystemExit(0)
+
+provider_id, provider_name, settings_config = row
+settings = json.loads(settings_config)
+provider_config = settings.get("config", "")
+provider_auth = settings.get("auth", {})
+
+def raw_value(text, key, default=None):
+    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.+)$", text)
+    return match.group(1).strip() if match else default
+
+model = raw_value(provider_config, "model", '"gpt-5"')
+base_url = raw_value(provider_config, "base_url")
+wire_api = raw_value(provider_config, "wire_api", '"responses"')
+requires_openai_auth = raw_value(provider_config, "requires_openai_auth", "true")
+
+if not base_url:
+    print(f"Codex custom normalization skipped; provider {provider_id} has no base_url.")
+    raise SystemExit(0)
+
+old_lines = config_path.read_text(encoding="utf-8").splitlines()
+top_lines = []
+section_chunks = []
+current_header = None
+current_chunk = []
+
+for line in old_lines:
+    header = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+    if header:
+        if current_header is not None:
+            section_chunks.append((current_header, current_chunk))
+        current_header = header.group(1)
+        current_chunk = [line]
+        continue
+
+    if current_header is None:
+        if re.match(r"^\s*(model_provider|model)\s*=", line):
+            continue
+        top_lines.append(line)
+    else:
+        current_chunk.append(line)
+
+if current_header is not None:
+    section_chunks.append((current_header, current_chunk))
+
+while top_lines and top_lines[0] == "":
+    top_lines.pop(0)
+while top_lines and top_lines[-1] == "":
+    top_lines.pop()
+
+new_lines = [
+    'model_provider = "custom"',
+    f"model = {model}",
+]
+
+if top_lines:
+    new_lines.extend(top_lines)
+
+new_lines.extend([
+    "",
+    "[model_providers.custom]",
+    f"name = {json.dumps(str(provider_name or provider_id), ensure_ascii=False)}",
+    f"base_url = {base_url}",
+    f"wire_api = {wire_api}",
+    f"requires_openai_auth = {requires_openai_auth}",
+])
+
+for header, chunk in section_chunks:
+    if header.startswith("model_providers."):
+        continue
+    while chunk and chunk[-1] == "":
+        chunk.pop()
+    if chunk:
+        new_lines.append("")
+        new_lines.extend(chunk)
+
+new_text = "\n".join(new_lines).rstrip() + "\n"
+old_text = config_path.read_text(encoding="utf-8")
+if new_text != old_text:
+    fd, tmp_name = tempfile.mkstemp(prefix=".config.", suffix=".toml", dir=str(config_path.parent))
+    with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+        tmp.write(new_text)
+    os.replace(tmp_name, config_path)
+    print(f"Codex config normalized to model_provider=custom for {provider_id} ({provider_name}).")
+else:
+    print(f"Codex config already normalized for {provider_id} ({provider_name}).")
+
+if provider_auth:
+    existing_auth = {}
+    if auth_path.exists():
+        try:
+            existing_auth = json.loads(auth_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing_auth = {}
+    existing_auth.update(provider_auth)
+    auth_text = json.dumps(existing_auth, indent=2, ensure_ascii=False) + "\n"
+    if not auth_path.exists() or auth_path.read_text(encoding="utf-8") != auth_text:
+        fd, tmp_name = tempfile.mkstemp(prefix=".auth.", suffix=".json", dir=str(auth_path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(auth_text)
+        os.replace(tmp_name, auth_path)
+        print("Codex auth synchronized for current provider.")
+
+migrated = 0
+if sessions_dir.exists():
+    for session_file in sessions_dir.rglob("*.jsonl"):
+        try:
+            text = session_file.read_text(encoding="utf-8")
+            first_line, separator, rest = text.partition("\n")
+            if not first_line:
+                continue
+            first = json.loads(first_line)
+            payload = first.get("payload")
+            if first.get("type") != "session_meta" or not isinstance(payload, dict):
+                continue
+            if payload.get("model_provider") == "custom":
+                continue
+            payload["model_provider"] = "custom"
+            new_first = json.dumps(first, ensure_ascii=False, separators=(",", ":"))
+            new_text = new_first + (separator + rest if separator else "")
+            fd, tmp_name = tempfile.mkstemp(prefix=".session.", suffix=".jsonl", dir=str(session_file.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write(new_text)
+            os.replace(tmp_name, session_file)
+            migrated += 1
+        except Exception as exc:
+            print(f"Codex session metadata migration skipped for {session_file}: {exc}")
+
+if migrated:
+    print(f"Codex session metadata migrated to model_provider=custom: {migrated} file(s).")
+PY
+}
+
+restart_codex_processes() {
+  local pids pid alive_count
+
+  normalize_codex_config 2>&1 | while IFS= read -r line; do
+    [ -n "$line" ] && log "$line"
+  done
+
+  pids="$(collect_codex_pids | sort -u)"
+
+  if [ -z "$pids" ]; then
+    find "$CODEX_HOME_DIR/app-server-control" -maxdepth 1 -type s -name '*.sock' -delete 2>/dev/null || true
+    log "Codex config changed; no running Codex process found."
+    return 0
+  fi
+
+  alive_count="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')"
+  log "Codex config changed; restarting $alive_count Codex process(es)."
+
+  for pid in $pids; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+
+  sleep 1
+
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+
+  find "$CODEX_HOME_DIR/app-server-control" -maxdepth 1 -type s -name '*.sock' -delete 2>/dev/null || true
+  log "Codex restart complete; the next Codex CLI/App connection will load the new config."
+}
+
+restart_codex_processes

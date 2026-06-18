@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -u
+
+REAL_BIN="${CC_SWITCH_CLI_REAL:-/usr/local/bin/cc-switch-cli.real}"
+CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+REFRESH_BIN="${CC_SWITCH_CODEX_REFRESH:-/usr/local/bin/cc-switch-refresh-codex}"
+LOG_FILE="${CC_SWITCH_CODEX_MONITOR_LOG:-$HOME/.cc-switch/codex-refresh.log}"
+CC_SWITCH_DB_PATH="${CC_SWITCH_DB_PATH:-$HOME/.cc-switch/cc-switch.db}"
+
+codex_signature() {
+  local file
+  for file in "$CODEX_HOME_DIR/config.toml" "$CODEX_HOME_DIR/auth.json" "$CC_SWITCH_DB_PATH"; do
+    if [ -f "$file" ]; then
+      stat -c '%n:%Y:%s' "$file" 2>/dev/null || true
+      sha256sum "$file" 2>/dev/null || true
+    else
+      printf '%s:missing\n' "$file"
+    fi
+  done
+}
+
+refresh_codex() {
+  local quiet="${1:-0}"
+  if [ -x "$REFRESH_BIN" ]; then
+    if [ "$quiet" = "1" ]; then
+      CC_SWITCH_CODEX_REFRESH_QUIET=1 "$REFRESH_BIN" || true
+    else
+      "$REFRESH_BIN" || true
+    fi
+  else
+    printf '[cc-switch] Codex config changed, but refresh helper is missing: %s\n' "$REFRESH_BIN" >&2
+    log_monitor "refresh helper missing: $REFRESH_BIN"
+  fi
+}
+
+normalize_args() {
+  NORMALIZED_ARGS=("$@")
+
+  if [ "$#" -eq 0 ] || [ "${1:-}" != "sessions" ]; then
+    return 0
+  fi
+
+  local arg prev has_selector=0 wants_help=0
+  prev=""
+  for arg in "$@"; do
+    case "$arg" in
+      -a|--app|--provider|--all)
+        has_selector=1
+        ;;
+      --app=*|--provider=*)
+        has_selector=1
+        ;;
+      -h|--help|help)
+        wants_help=1
+        ;;
+      *)
+        if [ "$prev" = "-a" ] || [ "$prev" = "--app" ] || [ "$prev" = "--provider" ]; then
+          has_selector=1
+        fi
+        ;;
+    esac
+    prev="$arg"
+  done
+
+  if [ "$has_selector" -eq 0 ] && [ "$wants_help" -eq 0 ]; then
+    shift
+    NORMALIZED_ARGS=("sessions" "-a" "codex" "$@")
+  fi
+}
+
+log_monitor() {
+  local log_dir
+  log_dir="$(dirname "$LOG_FILE")"
+  mkdir -p "$log_dir" 2>/dev/null || true
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+if [ ! -x "$REAL_BIN" ]; then
+  printf '[cc-switch] real binary not found or not executable: %s\n' "$REAL_BIN" >&2
+  exit 127
+fi
+
+normalize_args "$@"
+
+before_signature="$(codex_signature)"
+log_monitor "start command: ${NORMALIZED_ARGS[*]}"
+
+"$REAL_BIN" "${NORMALIZED_ARGS[@]}"
+status=$?
+
+if [ "$status" -eq 0 ]; then
+  after_signature="$(codex_signature)"
+  if [ "$before_signature" != "$after_signature" ]; then
+    log_monitor "codex config changed after command: ${NORMALIZED_ARGS[*]}"
+    refresh_codex 0
+  else
+    log_monitor "no codex config change after command: ${NORMALIZED_ARGS[*]}"
+  fi
+else
+  log_monitor "command failed status=$status: ${NORMALIZED_ARGS[*]}"
+fi
+
+exit "$status"
